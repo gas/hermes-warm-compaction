@@ -161,9 +161,52 @@ def units(messages: list) -> list[tuple[int, int]]:
     return spans
 
 
+# The largest forced growth of the tail for the final reply chain: a large tool group in front of the chain
+# must not pull the whole group into the tail.
+REPLY_CHAIN_MAX = 16_000
+
+
+def _is_reply_row(row: Any, prefixes: tuple[str, ...]) -> bool:
+    """An assistant row that is a visible reply: no tool calls, non-empty text, not a summary carrier.
+    The same definition the host's reply anchor uses for the just-delivered reply
+    (agent.conversation_compression_reply_anchor, #118900)."""
+    if not isinstance(row, dict) or attr(row, "role") != "assistant" or attr(row, "tool_calls"):
+        return False
+    if is_summary(row, prefixes):
+        return False
+    return bool(visible_text(api_content(row)).strip())
+
+
+def reply_chain_start(messages: list, prefixes: Iterable[str]) -> int:
+    """Return the first index of the final reply chain, aligned to a unit start.
+
+    The chain is the last visible assistant reply and the rows that follow it until the end, as long as every
+    row is a visible reply or a non-real-user row (a background-process notification and the short reply that
+    the notification draws). The boundary backs up to the start of the unit that contains it, so a tool-call
+    row and its results are never split from the chain.
+    """
+    prefixes = tuple(prefixes)
+    index = len(messages)
+    while index > 0:
+        row = messages[index - 1]
+        if _is_reply_row(row, prefixes) or (attr(row, "role") == "user" and not is_real_user(row, prefixes)):
+            index -= 1
+        else:
+            break
+    for span_start, span_end in units(messages):
+        if span_start <= index < span_end:
+            return span_start
+    return index
+
+
 def tail_start(messages: list, tail_tokens: int, prefixes: Iterable[str],
                policy: SendPolicy = SendPolicy()) -> tuple[int, dict[str, Any] | None]:
-    """Return the first tail index and, in the middle of a task, a copy of the latest real user row."""
+    """Return the first tail index and, in the middle of a task, a copy of the latest real user row.
+
+    The final reply chain (reply_chain_start) must stay in the tail: when the budget cut lands inside it, the
+    host's reply anchor usually cannot reinsert the reply (its slot is assistant-adjacent), and the model would
+    lose its own last answer.
+    """
     prefixes = tuple(prefixes)
     spans = units(messages)
     if not spans:
@@ -177,6 +220,13 @@ def tail_start(messages: list, tail_tokens: int, prefixes: Iterable[str],
             break
         size += cost
         start = span_start
+    chain = reply_chain_start(messages, prefixes)
+    if 0 < chain < start:
+        extra = sum(sent_tokens(row, policy) for row in messages[chain:start])
+        if extra <= REPLY_CHAIN_MAX:
+            # The chain does not fit in the budget: pull it in whole. A chain above the cap is not forced: a
+            # huge reply would eat the window, and the tail keeps the old cap behavior.
+            start = chain
     for index in range(start, len(messages)):
         if is_real_user(messages[index], prefixes):
             return index, None

@@ -1740,7 +1740,9 @@ class EngineTest(unittest.TestCase):
         self.llm = FakeLlm(text=HEADINGS_TEXT.replace("- [OPEN] Write the report.", "- " + state)
                           .replace('- "Use short names."', '- "Check PKG-17 progress."')
                           + "\n" + END_LINE)
-        engine = self.make(warm=False)
+        # The strict gate repairs unverified state; it is opt-in now (fallback_strict_gate) because on a local
+        # model the strict gate discarded almost everything on a large session.
+        engine = self.make(warm=False, fallback_strict_gate=True)
         history = [user("Check PKG-17 progress."), *old_turns(), assistant("synthetic final reply")]
         original = copy.deepcopy(history)
         new = engine.compress(history)
@@ -2239,7 +2241,9 @@ class SettingsTest(unittest.TestCase):
 
     def test_valid_values(self):
         values = {"threshold": 0.6, "tail_tokens": 12_000, "user_copy_chars": 0, "warm": False,
-                  "summary_words": 1200, "warm_providers": "opencode-go,commandcode"}
+                  "summary_words": 1200, "warm_providers": "opencode-go,commandcode",
+                  "fallback_transcript_tokens": 0, "fallback_strict_gate": False,
+                  "warm_timeout_s": 120, "fallback_timeout_s": 120}
         self.assertEqual(self.module.read_settings(lambda key, default: values.get(key, default)), values)
 
     def test_invalid_values_use_the_defaults_with_a_warning(self):

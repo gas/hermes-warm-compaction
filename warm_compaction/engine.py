@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 NAME = "warm_compaction"
 DEFAULTS: dict[str, Any] = {"threshold": 0.50, "tail_tokens": 0, "user_copy_chars": 24_000, "warm": True,
                             "summary_words": handoff.DEFAULT_SUMMARY_WORDS,
-                            "warm_providers": ""}
+                            "warm_providers": "",
+                            "fallback_transcript_tokens": 0,
+                            "fallback_strict_gate": False,
+                            "warm_timeout_s": 120,
+                            "fallback_timeout_s": 120}
 THRESHOLD_RANGE = (0.10, 0.95)
 TAIL_SHARE = 0.025
 TAIL_MIN = 10_000
@@ -74,6 +78,8 @@ class CompactionAborted(RuntimeError):
 
 def _valid(key: str, value: Any) -> bool:
     if key == "warm":
+        return isinstance(value, bool)
+    if key == "fallback_strict_gate":
         return isinstance(value, bool)
     if key == "warm_providers":
         return isinstance(value, str)
@@ -343,6 +349,12 @@ class WarmCompactionEngine(ContextEngine):
                                            policy)
         if start <= 0:
             return messages
+        # The reply chain can push the tail past its cap (tail_start forces it in): when the chain is in the
+        # tail, bound_tail must not cut it. A chain that tail_start did not force (it starts before the tail)
+        # keeps the old cap behavior.
+        chain_start = layout.reply_chain_start(messages, prefixes)
+        tail_floor = (sum(sent_tokens(row, policy) for row in messages[chain_start:])
+                      if start <= chain_start < len(messages) else 0)
         with self._wc_result_lock:
             if self._native_available and not self._native_notice_logged:
                 self._native_notice_logged = True
@@ -364,16 +376,27 @@ class WarmCompactionEngine(ContextEngine):
         # The middles that the tail cuts (see layout.bound_tail): the rows before the tail do not have them.
         removed: list = []
         if summary is None and not self._cancelled() and self._attempt() == attempt:
-            layout.bound_tail(messages[start:], self._tail_cap(SUMMARY_RESERVE, overhead, reserve), removed, policy)
+            layout.bound_tail(messages[start:],
+                              max(self._tail_cap(SUMMARY_RESERVE, overhead, reserve), tail_floor), removed, policy)
             # Only the rows before the tail: the tail stays as it is, and a transcript of the whole history
             # can spend its budget on the tail.
             # The plugin API has no request on a set route (an override needs a trust setting), and the auto
             # task follows the main route. The last check runs just before the request starts: after a switch,
             # the old transcript does not go to the new route.
+            # The fallback transcript covers the whole window the compaction folds: at most the threshold (the
+            # history cannot be larger when compaction starts) and at most the window less room for the
+            # instruction and the reply. 0 keeps the small default (fallback.TRANSCRIPT_CHARS).
+            transcript_tokens = int(self._settings.get("fallback_transcript_tokens") or 0)
+            if transcript_tokens <= 0:
+                transcript_tokens = max(fallback.TRANSCRIPT_TOKENS,
+                                        min(self.threshold_tokens,
+                                            max(0, int(self.context_length or 0) - 20_000)))
             failure: dict[str, Any] = {}
             summary, _tokens = fallback.llm_summary(
                 self._llm, [*messages[:start], *removed], prefixes, focus_topic=focus_topic, memory_context=memory,
                 task=self._task, summary_words=self._settings["summary_words"],
+                transcript_chars=transcript_tokens * 4, strict=bool(self._settings["fallback_strict_gate"]),
+                timeout_s=float(self._settings["fallback_timeout_s"]),
                 ready=lambda: not self._cancelled() and self._attempt() == attempt, failure=failure)
             if summary is None:
                 record["fallback_reason"] = failure.get("reason", "unavailable")
@@ -404,8 +427,9 @@ class WarmCompactionEngine(ContextEngine):
         # The prepended user row must be in the tail: when it does not fit in the room, keep its start and end.
         # With an unknown overhead, the room is unknown too: the row keeps only its minimum. The room is after the
         # tail as the cap cuts it: an uncut large tool result would leave no room.
-        bounded = layout.bound_tail(messages[start:], self._tail_cap(estimate_tokens(summary), overhead, reserve),
-                                    policy=policy)
+        bounded = layout.bound_tail(
+            messages[start:], max(self._tail_cap(estimate_tokens(summary), overhead, reserve), tail_floor),
+            policy=policy)
         room = self._room(bounded, summary, overhead or 0, reserve, policy)
         cut: list = []
         if prepend is not None and room is not None:
@@ -432,7 +456,7 @@ class WarmCompactionEngine(ContextEngine):
                         record["fallback_reason"] = "quote_capacity"
                         return self._abort(messages, record, started, attempt)
         prepend_tokens = sent_tokens(prepend, policy) if prepend is not None else 0
-        tail_tokens = self._tail_cap(estimate_tokens(summary), overhead, reserve, prepend_tokens)
+        tail_tokens = max(self._tail_cap(estimate_tokens(summary), overhead, reserve, prepend_tokens), tail_floor)
         # The copies get the room after the tail as build cuts it: the uncut tail can be much larger.
         copy_tokens = 0 if overhead is None else self._copy_tokens(
             layout.bound_tail(messages[start:], tail_tokens, policy=policy), summary, overhead, reserve, policy)
@@ -643,7 +667,8 @@ class WarmCompactionEngine(ContextEngine):
             wire_body = ({name: value for name, value in base.items() if name != "extra_headers"}
                          if request_headers else base)
             result = warm.send(wire_body, route[1], key, post=self._post, extra_headers=headers, ssl_context=tls,
-                               api_mode=route[2], provider=provider)
+                               api_mode=route[2], provider=provider,
+                               timeout_s=float(self._settings["warm_timeout_s"]))
             # The send blocks on the network: a switch can occur before it returns.
             if self._attempt() != attempt:
                 raise warm.WarmRefusal("route_changed")

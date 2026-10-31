@@ -262,12 +262,14 @@ def _row_content(row: Any, full: str, shown: str) -> list[str]:
 
 
 def transcript(messages: list, prefixes: Iterable[str], reserve_chars: int = 0, reserve_tokens: int = 0,
-               *, _content: list[str] | None = None) -> str:
+               *, transcript_chars: int | None = None, _content: list[str] | None = None) -> str:
     """Return a bounded transcript: the earlier summary, the first user message, then the newest rows.
 
     Each row entry keeps at most ROW_CHARS characters (its start and its end), so that one long row cannot
     push all earlier turns out. The oldest row that does not fit in the remaining budget is cut to fit.
     reserve_chars and reserve_tokens are taken from the budget for other text in the same request.
+    transcript_chars raises the default budget (TRANSCRIPT_CHARS) when the caller knows the model context can
+    hold the whole compaction window; the token budget is derived from the char budget (4 chars per token).
     """
     prefixes = tuple(prefixes)
     head = []
@@ -283,8 +285,10 @@ def transcript(messages: list, prefixes: Iterable[str], reserve_chars: int = 0, 
         if _content is not None:
             full = "[first user message]\n" + visible_text(api_content(first)).strip()
             _content.extend(_row_content(first, full, head[-1]))
-    budget = TRANSCRIPT_CHARS - reserve_chars - sum(len(part) + 2 for part in head)
-    tokens = TRANSCRIPT_TOKENS - reserve_tokens - sum(estimate_tokens(part) + 1 for part in head)
+    limit_chars = int(transcript_chars) if transcript_chars and int(transcript_chars) > 0 else TRANSCRIPT_CHARS
+    limit_tokens = max(1, limit_chars // 4)
+    budget = limit_chars - reserve_chars - sum(len(part) + 2 for part in head)
+    tokens = limit_tokens - reserve_tokens - sum(estimate_tokens(part) + 1 for part in head)
     # A tool row takes the names of the nearest earlier tool calls. Providers can use the same call id again
     # in a later turn.
     turn_names: list[dict[str, str]] = []
@@ -515,6 +519,24 @@ def _has_useful_evidence(text: str, source: _SourceTable) -> bool:
                for line in lines[start:end] if (value := _json_quote(line)) is not None)
 
 
+def _unquote_bullets(text: str) -> str:
+    """Relaxed gate: a bullet that is a JSON string becomes "- " plus its plain text; anything else is kept as-is."""
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        value = _json_quote(line)
+        if value is not None:
+            lines[index] = "- " + value
+    return "\n".join(lines)
+
+
+def _has_any_content(text: str) -> bool:
+    """Relaxed gate: at least one reported (non-unknown) bullet in any section."""
+    lines = text.splitlines()
+    return any(line.strip() and line.strip() != unknown
+               for start, end, unknown in _source_spans(lines)
+               for line in lines[start:end])
+
+
 def _construct_current_state(text: str, original: str | _SourceTable, prefixes: Iterable[str]) -> str:
     """Construct all sections in retention priority, with room for every unknown and normal heading order."""
     source = original if isinstance(original, _SourceTable) else _SourceTable(original)
@@ -569,12 +591,16 @@ def _construct_current_state(text: str, original: str | _SourceTable, prefixes: 
 def llm_summary(llm: Any, messages: list, prefixes: Iterable[str], *, focus_topic: str | None = None,
                 memory_context: str = "", task: str | None = TASK, timeout_s: float = TIMEOUT_S,
                 summary_words: int = DEFAULT_SUMMARY_WORDS,
+                transcript_chars: int | None = None, strict: bool = True,
                 ready: Callable[[], bool] | None = None,
                 failure: dict[str, Any] | None = None) -> tuple[str | None, int | None]:
     """Return (summary text, prompt tokens) from ctx.llm, or (None, None) when the request or the reply fails.
     ready checks the route and cancellation before each call and after each reply.
     An invalid reply gets one retry; a missing or duplicated end marker gets two. All calls share one time limit.
-    failure gets safe codes and bounded reply metadata only. It never gets provider text."""
+    failure gets safe codes and bounded reply metadata only. It never gets provider text.
+    strict verifies every bullet against the source lines and drops the unverified ones; relaxed (strict=False)
+    keeps all bullets: for a local model on a large session the strict gate discarded almost everything
+    ("unknown"), which is exactly what the 2026-10-24 postmortem degenerate fallbacks were."""
     if failure is not None:
         failure.clear()
     if llm is None:
@@ -586,8 +612,9 @@ def llm_summary(llm: Any, messages: list, prefixes: Iterable[str], *, focus_topi
     # The start (the focus line) and the end of a large memory context.
     extra = _bound(extras(focus_topic, memory_context), EXTRAS_CHARS, EXTRAS_TOKENS, middle=True)
     content: list[str] = []
-    original = transcript(messages, prefixes, len(extra), estimate_tokens(extra), _content=content)
-    source = _SourceTable(original, _earlier_summary(messages, prefixes), extra, content)
+    original = transcript(messages, prefixes, len(extra), estimate_tokens(extra), transcript_chars=transcript_chars,
+                          _content=content)
+    source = _SourceTable(original, _earlier_summary(messages, prefixes), extra, content) if strict else None
     reason: str | None = None  # The previous attempt's failure code; the loop only continues on one.
     for attempt in range(1, MAX_ATTEMPTS + 1):
         end_line = END_LINE.replace("{nonce}", secrets.token_hex(16))
@@ -652,14 +679,23 @@ def llm_summary(llm: Any, messages: list, prefixes: Iterable[str], *, focus_topi
                 if text is not None and estimate_tokens(body) > MAX_TOKENS:
                     text, reason = None, "body_token_limit"
             if text is not None:
-                text = _construct_current_state(text, source, prefixes)
-                text, reason = gate_content(text, prefixes)
-                if text is not None and estimate_tokens(text) > MAX_TOKENS:
-                    text, reason = None, "body_token_limit"
-                if text is not None and not _source_current_state(text, source):
-                    text, reason = None, "current_state_unverified"
-                if text is not None and not _has_useful_evidence(text, source):
-                    text, reason = None, "no_useful_evidence"
+                if strict:
+                    assert source is not None  # strict built the table above
+                    text = _construct_current_state(text, source, prefixes)
+                    text, reason = gate_content(text, prefixes)
+                    if text is not None and estimate_tokens(text) > MAX_TOKENS:
+                        text, reason = None, "body_token_limit"
+                    if text is not None and not _source_current_state(text, source):
+                        text, reason = None, "current_state_unverified"
+                    if text is not None and not _has_useful_evidence(text, source):
+                        text, reason = None, "no_useful_evidence"
+                else:
+                    text = _unquote_bullets(text)
+                    text, reason = gate_content(text, prefixes)
+                    if text is not None and estimate_tokens(text) > MAX_TOKENS:
+                        text, reason = None, "body_token_limit"
+                    if text is not None and not _has_any_content(text):
+                        text, reason = None, "no_useful_evidence"
         if text is not None:
             tokens = getattr(getattr(result, "usage", None), "input_tokens", None)
             return text, tokens if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0 else None
