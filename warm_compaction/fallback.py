@@ -91,7 +91,8 @@ Each instruction, rule, or preference from the user that still applies. Use "- i
 usable instruction was reported.
 
 ## Current state
-Prefer the latest user correction or direct tool result. \
+Prefer the latest user correction or direct tool result. When the transcript ends in the middle of a turn, the \
+current state is the in-progress step reported in the last rows. \
 Keep the reported scope; a completed tool call does not prove completion of a broader task. A source quote \
 records what was reported, not what is currently true. Use "- progress unknown" when no usable state was reported.
 
@@ -100,8 +101,10 @@ Identifiers, names, values, and results that the next step needs. \
 Use the exact line "- facts unknown" when no usable facts were reported.
 
 ## Next step
-The next action that the user asked for and its exact target. Use "- next step unknown" when no usable next \
-step was reported. Do not add a condition, delay, or permission that the user did not require.
+The next action that the user asked for and its exact target. When the transcript ends in the middle of a turn \
+(the last rows are the tool calls or results of an in-progress step), it is the reported continuation of that \
+step, not a step of an earlier plan. Use "- next step unknown" when no usable next step was reported. Do not add \
+a condition, delay, or permission that the user did not require.
 
 End the summary with this line:
 [END OF SUMMARY {nonce}]

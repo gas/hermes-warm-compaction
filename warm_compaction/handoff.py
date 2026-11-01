@@ -42,6 +42,9 @@ One bullet for each task or request of the user. Start each bullet with one of t
 - [COMPLETE] when a later message reports that it is complete. A request is not complete only because the user \
 asked for it.
 - [OPEN] when it is not complete and nothing blocks it.
+- [IN PROGRESS] when the conversation ends in the middle of a turn and that work is happening now: the last \
+messages are the tool calls and results of the in-progress step. Name the current sub-step and what remains in \
+it, anchored on the last messages.
 - [BLOCKED] when it cannot continue until something missing arrives, for example an input or an approval. Name \
 what is missing.
 - [CANCELLED] when the user cancelled or replaced it.
@@ -52,7 +55,9 @@ current value and say that it replaces the old one. Write "unverified" next to a
 not confirm.
 
 ## Next step
-The next action that the user asked for, its exact target, and, if it is blocked, what is missing. Describe it. \
+The immediate continuation of the conversation at its last message. When the conversation ends in the middle of \
+a turn, it is the next action of the in-progress step, not a step of an earlier plan. Otherwise, it is the next \
+action that the user asked for. Give its exact target and, if it is blocked, what is missing. Describe it. \
 Do not do it.
 """
 
